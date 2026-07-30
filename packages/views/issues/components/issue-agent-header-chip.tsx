@@ -130,7 +130,6 @@ function ActiveChip({
 }: ActiveChipProps) {
   const { t } = useT("issues");
   const { getActorName } = useActorName();
-  const [openTranscriptTaskId, setOpenTranscriptTaskId] = useState<string | null>(null);
 
   const activeTasks = [...running, ...queued];
   const agentIds = [...new Set(activeTasks.map((task) => task.agent_id))];

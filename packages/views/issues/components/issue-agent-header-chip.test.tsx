@@ -81,7 +81,6 @@ vi.mock("./execution-log-section", () => ({
     onTranscriptOpenChange,
   }: {
     task: AgentTask;
-    transcriptOpen?: boolean;
     onTranscriptOpenChange?: (open: boolean) => void;
   }) => (
     <div data-testid="active-task-row">
