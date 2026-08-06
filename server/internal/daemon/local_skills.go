@@ -9,6 +9,7 @@ import (
 	"strings"
 
 	"github.com/multica-ai/multica/server/internal/skill"
+	"github.com/multica-ai/multica/server/pkg/agent"
 )
 
 const (
@@ -125,7 +126,14 @@ func localSkillRootsForProvider(provider string) ([]localSkillRoot, bool, error)
 	}
 
 	var providerRoot string
-	switch provider {
+	// Built-in runtime identities (e.g. "omp") declare their user skills dir
+	// in the descriptor; resolve to providerRoot and fall through to the
+	// common construction below so universal roots, merging, and fallback
+	// import all still apply — same as every protocol-family provider.
+	if desc, ok := agent.BuiltinRuntimeByID(provider); ok {
+		providerRoot = filepath.Join(home, desc.UserSkillsDir)
+	} else {
+		switch provider {
 	case "claude":
 		providerRoot = filepath.Join(home, ".claude", "skills")
 	case "codebuddy":
@@ -219,6 +227,7 @@ func localSkillRootsForProvider(provider string) ([]localSkillRoot, bool, error)
 		providerRoot = filepath.Join(qwenpawHome, "skill_pool")
 	default:
 		return nil, false, nil
+	}
 	}
 
 	roots := []localSkillRoot{
