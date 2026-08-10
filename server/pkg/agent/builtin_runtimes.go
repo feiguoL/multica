@@ -22,9 +22,9 @@ type BuiltinRuntime struct {
 	ID string
 
 	// ProtocolFamily is the execution backend this runtime dispatches to.
-	// It MUST be in SupportedTypes. The New() switch uses this to pick the
-	// backend struct, then passes ID-specific defaults (executable, label)
-	// via the descriptor.
+	// It MUST be in SupportedTypes. NewRuntime builds that family's backend
+	// via New(), then applies this descriptor's ID-specific defaults
+	// (executable, label) to it.
 	ProtocolFamily string
 
 	// DefaultCommand is the bare CLI name the probe looks up on PATH
@@ -60,10 +60,12 @@ type BuiltinRuntime struct {
 	ProviderLabel string
 
 	// ModelDiscovery is the strategy for discovering available models.
-	// When nil, ListModels falls back to the protocol family's default
-	// discovery (e.g. discoverPiModels for pi). When set, it overrides
-	// the family's discovery entirely — omp uses `omp models --json`, which
-	// is a different command and output shape from pi's `--list-models`.
+	// When set, it replaces the protocol family's discovery entirely — omp
+	// uses `omp models --json`, a different command and output shape from
+	// pi's `--list-models`. When nil, ListModels returns an empty catalog
+	// rather than falling back to the family's command: running a
+	// semantically incompatible one (omp exits non-zero on `--list-models`)
+	// is worse than degrading to manual entry.
 	ModelDiscovery ModelDiscoveryFunc
 }
 
@@ -83,7 +85,7 @@ type ModelDiscoveryFunc func(ctx context.Context, executablePath string) ([]Mode
 // a separate CLI that speaks the pi JSON event protocol.
 var BuiltinRuntimes = []BuiltinRuntime{
 	{
-		ID:               "omp",
+		ID:                "omp",
 		ProtocolFamily:    "pi",
 		DefaultCommand:    "omp",
 		EnvPrefix:         "MULTICA_OMP",
@@ -93,7 +95,7 @@ var BuiltinRuntimes = []BuiltinRuntime{
 		LaunchHeader:      "omp (json mode)",
 		DefaultExecutable: "omp",
 		ProviderLabel:     "omp",
-		ModelDiscovery:     discoverOmpModels,
+		ModelDiscovery:    discoverOmpModels,
 	},
 }
 
@@ -127,8 +129,9 @@ func BuiltinRuntimeCommands() []string {
 
 // backendOverrideApplicator is the interface that lets a descriptor apply
 // per-runtime overrides (executable, label) to the backend its protocol family
-// returned. Backends that support overrides implement this; others are
-// returned unchanged.
+// returned. A family whose backend does not implement it cannot host a runtime
+// identity at all: NewRuntime fails closed rather than handing back a backend
+// with the overrides silently dropped.
 type backendOverrideApplicator interface {
 	applyBuiltinRuntimeOverrides(desc BuiltinRuntime)
 }
@@ -155,9 +158,10 @@ func ResolveBackend(provider string, cfg Config) (Backend, error) {
 }
 
 // NewRuntime creates a Backend for a built-in runtime identity (e.g. "omp").
-// via New(), and applies per-runtime overrides through the
-// backendOverrideApplicator interface. This is the production entry point for
-// runtime identities; New() is family-only and rejects runtime ids.
+// It builds the descriptor's protocol family backend via New(), then applies
+// the per-runtime overrides through the backendOverrideApplicator interface.
+// This is the production entry point for runtime identities; New() is
+// family-only and rejects runtime ids.
 //
 // Fails closed: if the protocol family backend does not implement
 // backendOverrideApplicator, the descriptor's overrides cannot be applied and

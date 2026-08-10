@@ -1149,11 +1149,12 @@ func isPiDiscoveryNoise(line string) bool {
 }
 
 // discoverOmpModels runs `omp models --json` and parses the JSON catalog.
-// omp (oh-my-pi) rejects `--list-models` (a pi flag it never adopted); its
-// native discovery is `omp models --json`, which prints a JSON array of
-// model objects with at least `id` and `name` fields. An empty catalog or
-// a non-zero exit (binary missing, omp too old) falls back to an empty
-// list so the UI degrades to manual entry instead of erroring.
+// omp (oh-my-pi) rejects `--list-models` — a pi flag it never adopted, and it
+// exits non-zero on it — so its native discovery is `omp models --json`, which
+// prints a `{"models":[...]}` object; parseOmpModels documents the entry shape.
+// An empty catalog (an omp with no provider credentials configured prints
+// `{"models":[]}`) or a non-zero exit (binary missing, omp too old) falls back
+// to an empty list so the UI degrades to manual entry instead of erroring.
 func discoverOmpModels(ctx context.Context, executablePath string) ([]Model, error) {
 	if executablePath == "" {
 		executablePath = "omp"
