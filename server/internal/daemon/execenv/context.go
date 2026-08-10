@@ -9,8 +9,8 @@ import (
 	"regexp"
 	"strings"
 
-	"github.com/multica-ai/multica/server/pkg/agent"
 	skillpkg "github.com/multica-ai/multica/server/internal/skill"
+	"github.com/multica-ai/multica/server/pkg/agent"
 	"gopkg.in/yaml.v3"
 )
 

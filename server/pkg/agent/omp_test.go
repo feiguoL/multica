@@ -436,10 +436,10 @@ func TestOmpAndPiRegisterSideBySide(t *testing.T) {
 	// Probe both CLIs the way the daemon would — using the same env vars
 	// the descriptor-driven probe loop uses.
 	for _, tc := range []struct {
-		envPath string
+		envPath  string
 		envModel string
-		cmd string
-		id string
+		cmd      string
+		id       string
 	}{
 		{"MULTICA_PI_PATH", "MULTICA_PI_MODEL", "pi", "pi"},
 		{"MULTICA_OMP_PATH", "MULTICA_OMP_MODEL", "omp", "omp"},
