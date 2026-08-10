@@ -606,7 +606,7 @@ export function AgentTranscriptDialog({
 
   // Diagnostic detail for the ⓘ popover: everything a reader needs only when
   // debugging this specific run, kept off the always-visible surface.
-  const providerLabel = runtimeInfo?.provider ? providerDisplayName(runtimeInfo.provider) : null;
+  const providerLabel = runtimeInfo?.provider ? transcriptProviderLabel(runtimeInfo.provider) : null;
   const createdLabel = task.created_at ? formatRunTime(task.created_at) : null;
   const startedLabel = task.started_at ? formatRunTime(task.started_at) : null;
   const completedLabel = task.completed_at ? formatRunTime(task.completed_at) : null;
@@ -1060,6 +1060,22 @@ function SortDirectionToggle({ value, onChange, labels }: SortDirectionTogglePro
       </span>
     </Button>
   );
+}
+
+// Provider slugs this view names differently from the runtime list. The daemon
+// has no display-name override for Claude, so the shared formatter answers
+// "Claude" — but a run's diagnostics have always named the tool "Claude Code",
+// and `claude-code` is a legacy provider value still present on older tasks
+// (title-casing it alone would read as "Claude-code"). Every other provider
+// defers to the shared formatter so this row cannot drift from the runtime
+// list the way it did before (#5260).
+const TRANSCRIPT_PROVIDER_LABELS: Record<string, string> = {
+  claude: "Claude Code",
+  "claude-code": "Claude Code",
+};
+
+function transcriptProviderLabel(provider: string): string {
+  return TRANSCRIPT_PROVIDER_LABELS[provider.toLowerCase()] ?? providerDisplayName(provider);
 }
 
 // ─── Facts line separator ───────────────────────────────────────────────────
