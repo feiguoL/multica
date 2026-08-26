@@ -89,6 +89,27 @@ func TestListRuntimeLocalMcpServersUnknownProvider(t *testing.T) {
 	}
 }
 
+func TestMergeRuntimeAndAgentMcpConfigPiProvidersUseAgentConfig(t *testing.T) {
+	for _, provider := range []string{"pi", "omp"} {
+		t.Run(provider, func(t *testing.T) {
+			t.Setenv("HOME", t.TempDir())
+			merged, err := mergeRuntimeAndAgentMcpConfig(provider, json.RawMessage(`{"mcpServers":{"agent":{"command":"agent-server"}}}`))
+			if err != nil {
+				t.Fatal(err)
+			}
+			var document struct {
+				McpServers map[string]map[string]any `json:"mcpServers"`
+			}
+			if err := json.Unmarshal(merged, &document); err != nil {
+				t.Fatal(err)
+			}
+			if len(document.McpServers) != 1 || document.McpServers["agent"]["command"] != "agent-server" {
+				t.Fatalf("merged servers = %#v", document.McpServers)
+			}
+		})
+	}
+}
+
 func TestMergeRuntimeAndAgentMcpConfigClaudeCombinesAndAgentWins(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)

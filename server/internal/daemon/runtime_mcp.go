@@ -283,6 +283,12 @@ func loadRuntimeMcpServerConfigs(provider string) (map[string]any, bool, error) 
 			path = filepath.Join(stateDir, "openclaw.json")
 		}
 		key, format = "mcp.servers", "json"
+	case "pi", "omp":
+		// Pi and OMP discover MCP servers from `.mcp.json` in the project root,
+		// not from a global config file. There is no runtime-level inheritance
+		// to merge, so return supported=true with an empty server set — the
+		// agent's managed mcp_config is the sole source of MCP servers.
+		return map[string]any{}, true, nil
 	default:
 		return map[string]any{}, false, nil
 	}
