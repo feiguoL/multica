@@ -54,6 +54,34 @@ func TestListRuntimeLocalMcpServersClaudeMissingConfig(t *testing.T) {
 	}
 }
 
+func TestListRuntimeLocalMcpServersPiAndOmpReadNativeConfig(t *testing.T) {
+	for _, provider := range []string{"pi", "omp"} {
+		t.Run(provider, func(t *testing.T) {
+			home := t.TempDir()
+			t.Setenv("HOME", home)
+			configDir := filepath.Join(home, "."+provider, "agent")
+			if err := os.MkdirAll(configDir, 0o755); err != nil {
+				t.Fatal(err)
+			}
+			config := `{"mcpServers":{"native":{"command":"native-server","enabled":false}}}`
+			if err := os.WriteFile(filepath.Join(configDir, "mcp.json"), []byte(config), 0o600); err != nil {
+				t.Fatal(err)
+			}
+
+			servers, supported, err := listRuntimeLocalMcpServers(provider)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !supported || len(servers) != 1 {
+				t.Fatalf("supported=%v servers=%#v", supported, servers)
+			}
+			if servers[0].Name != "native" || servers[0].Transport != "stdio" || servers[0].Enabled {
+				t.Fatalf("native summary = %#v", servers[0])
+			}
+		})
+	}
+}
+
 func TestListRuntimeLocalMcpServersClaudeEnabledPlugin(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)

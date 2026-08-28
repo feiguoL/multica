@@ -1,0 +1,86 @@
+package execenv
+
+import (
+	"encoding/json"
+	"errors"
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+)
+
+func TestPreparePiMcpConfigUsesProviderNamespace(t *testing.T) {
+	for _, provider := range []string{"pi", "omp"} {
+		t.Run(provider, func(t *testing.T) {
+			workDir := t.TempDir()
+			manifest := &sidecarManifest{}
+			raw := json.RawMessage(`{"mcpServers":{"fetch":{"command":"uvx"}}}`)
+
+			if err := preparePiMcpConfig(workDir, provider, raw, manifest); err != nil {
+				t.Fatalf("preparePiMcpConfig: %v", err)
+			}
+			path := filepath.Join(workDir, "."+provider, "mcp.json")
+			data, err := os.ReadFile(path)
+			if err != nil {
+				t.Fatalf("read %s: %v", path, err)
+			}
+			if string(data) != string(raw) {
+				t.Fatalf("config = %s, want %s", data, raw)
+			}
+			if !containsPath(manifest.Files, path) || !containsPath(manifest.Dirs, filepath.Dir(path)) {
+				t.Fatalf("manifest = %#v, want config file and directory", manifest)
+			}
+		})
+	}
+}
+
+func TestPreparePiMcpConfigRefusesExistingManagedPath(t *testing.T) {
+	workDir := t.TempDir()
+	path := filepath.Join(workDir, ".pi", "mcp.json")
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	existing := []byte(`{"mcpServers":{"user":{"command":"echo"}}}`)
+	if err := os.WriteFile(path, existing, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	err := preparePiMcpConfig(workDir, "pi", json.RawMessage(`{"mcpServers":{"managed":{}}}`), &sidecarManifest{})
+	if err == nil || !strings.Contains(err.Error(), "would overwrite") {
+		t.Fatalf("error = %v, want overwrite error", err)
+	}
+	data, readErr := os.ReadFile(path)
+	if readErr != nil {
+		t.Fatal(readErr)
+	}
+	if string(data) != string(existing) {
+		t.Fatalf("existing config changed to %s", data)
+	}
+}
+
+func TestPreparePiMcpConfigCleanupRemovesManagedFiles(t *testing.T) {
+	workDir := t.TempDir()
+	envRoot := t.TempDir()
+	manifest := &sidecarManifest{}
+	if err := preparePiMcpConfig(workDir, "omp", json.RawMessage(`{"mcpServers":{"fetch":{}}}`), manifest); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeSidecarManifest(envRoot, manifest); err != nil {
+		t.Fatal(err)
+	}
+	if err := CleanupSidecars(envRoot); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(filepath.Join(workDir, ".omp", "mcp.json")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("managed config still exists, stat error = %v", err)
+	}
+}
+
+func containsPath(paths []string, want string) bool {
+	for _, path := range paths {
+		if path == want {
+			return true
+		}
+	}
+	return false
+}

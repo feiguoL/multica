@@ -61,8 +61,8 @@ type PrepareParams struct {
 	OpenclawBin  string // resolved openclaw CLI path (only used when Provider == "openclaw"); empty = look up on PATH
 	// McpConfig is the agent's saved `mcp_config` JSON, forwarded to the
 	// provider-specific config preparer when that provider materialises MCP
-	// via a per-task config file. Cursor and OpenClaw consume it here; other
-	// providers wire MCP via ExecOptions.McpConfig in the agent backend.
+	// via a per-task config file. Cursor, OpenClaw, Pi, and OMP consume it here;
+	// other providers wire MCP via ExecOptions.McpConfig in the agent backend.
 	McpConfig json.RawMessage
 	// CursorMcpAuthSource is an explicit opt-in path to a Cursor mcp-auth.json
 	// file, or the Cursor project data directory containing it. Only Cursor's
@@ -603,6 +603,9 @@ func Prepare(params PrepareParams, logger *slog.Logger) (*Environment, error) {
 	if err := writeContextFiles(workDir, params.Provider, params.Task, manifest); err != nil {
 		return nil, fmt.Errorf("execenv: write context files: %w", err)
 	}
+	if err := preparePiMcpConfig(workDir, params.Provider, params.McpConfig, manifest); err != nil {
+		return nil, fmt.Errorf("execenv: prepare %s mcp config: %w", params.Provider, err)
+	}
 
 	// Persist managed-env provenance for non-local resumable envs at Prepare time
 	// (not on completion, where .gc_meta.json is written). A same-issue
@@ -894,6 +897,9 @@ func Reuse(params ReuseParams, logger *slog.Logger) *Environment {
 	manifest := &sidecarManifest{}
 	if err := writeContextFiles(params.WorkDir, params.Provider, params.Task, manifest); err != nil {
 		logger.Warn("execenv: refresh context files failed", "error", err)
+	}
+	if err := preparePiMcpConfig(params.WorkDir, params.Provider, params.McpConfig, manifest); err != nil {
+		logger.Warn("execenv: refresh pi mcp config failed", "error", err)
 	}
 
 	// Restore CodexHome for Codex provider — the per-task codex-home directory

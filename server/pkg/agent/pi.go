@@ -227,45 +227,6 @@ func (b *piBackend) Execute(ctx context.Context, prompt string, opts ExecOptions
 		return nil, fmt.Errorf("%s session file: %w", label, err)
 	}
 
-	// Materialise the agent's MCP config into `.mcp.json` in the task's
-	// working directory. Both Pi and OMP (oh-my-pi) discover MCP servers from
-	// a `.mcp.json` file in the project root, so writing it here is the
-	// supported path — no --mcp-config flag exists on either CLI. When the
-	// agent has no managed mcp_config (nil/null), we leave any existing file
-	// untouched so a runtime's own inheritance path stays intact.
-	var mcpCleanupOnce sync.Once
-	mcpCleanup := func() {}
-	if hasManagedMcpConfig(opts.McpConfig) && opts.Cwd == "" {
-		return nil, fmt.Errorf("%s: mcp_config is set but no working directory is configured", label)
-	}
-	if hasManagedMcpConfig(opts.McpConfig) {
-		mcpPath := filepath.Join(opts.Cwd, ".mcp.json")
-		if _, err := os.Stat(mcpPath); err == nil {
-			return nil, fmt.Errorf("%s: managed mcp_config would overwrite existing .mcp.json in workdir", label)
-		} else if !os.IsNotExist(err) {
-			return nil, fmt.Errorf("%s: stat .mcp.json: %w", label, err)
-		}
-		mcpTempDir, err := os.MkdirTemp("", "multica-pi-mcp-")
-		if err != nil {
-			return nil, fmt.Errorf("%s: create mcp temp directory: %w", label, err)
-		}
-		data, err := hardenBrowserMcpConfig(opts.McpConfig, mcpTempDir)
-		if err != nil {
-			_ = os.RemoveAll(mcpTempDir)
-			return nil, fmt.Errorf("%s: prepare mcp_config: %w", label, err)
-		}
-		if err := os.WriteFile(mcpPath, data, 0o600); err != nil {
-			_ = os.RemoveAll(mcpTempDir)
-			return nil, fmt.Errorf("%s: write .mcp.json: %w", label, err)
-		}
-		mcpCleanup = func() {
-			mcpCleanupOnce.Do(func() {
-				_ = os.Remove(mcpPath)
-				_ = os.RemoveAll(mcpTempDir)
-			})
-		}
-	}
-
 	runCtx, cancel := runContext(ctx, timeout)
 
 	args := buildPiArgs(sessionPath, opts, b.cfg.Logger)
@@ -281,7 +242,6 @@ func (b *piBackend) Execute(ctx context.Context, prompt string, opts ExecOptions
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
 		cancel()
-		mcpCleanup()
 		return nil, fmt.Errorf("%s stdout pipe: %w", label, err)
 	}
 	// Pi reads piped stdin to EOF as its initial prompt in print/JSON mode.
@@ -292,7 +252,6 @@ func (b *piBackend) Execute(ctx context.Context, prompt string, opts ExecOptions
 	stdin, err := cmd.StdinPipe()
 	if err != nil {
 		cancel()
-		mcpCleanup()
 		return nil, fmt.Errorf("%s stdin pipe: %w", label, err)
 	}
 	var closeStdinOnce sync.Once
@@ -302,7 +261,6 @@ func (b *piBackend) Execute(ctx context.Context, prompt string, opts ExecOptions
 	if err := startOwnedProcessTree(cmd, b.cfg.Logger); err != nil {
 		closeStdin()
 		cancel()
-		mcpCleanup()
 		return nil, fmt.Errorf("start %s: %w", label, err)
 	}
 
@@ -332,7 +290,6 @@ func (b *piBackend) Execute(ctx context.Context, prompt string, opts ExecOptions
 
 	go func() {
 		defer cancel()
-		defer mcpCleanup()
 		defer close(msgCh)
 		defer close(resCh)
 
@@ -500,7 +457,6 @@ func (b *piBackend) Execute(ctx context.Context, prompt string, opts ExecOptions
 
 		b.cfg.Logger.Info(label+" finished", "pid", cmd.Process.Pid, "status", finalStatus, "duration", duration.Round(time.Millisecond).String())
 
-		mcpCleanup()
 		resCh <- Result{
 			Status:     finalStatus,
 			Output:     output.String(),
