@@ -10,27 +10,23 @@ import (
 )
 
 func TestPrepareOmpMcpConfigUsesProviderNamespace(t *testing.T) {
-	for _, provider := range []string{"omp"} {
-		t.Run(provider, func(t *testing.T) {
-			workDir := t.TempDir()
-			manifest := &sidecarManifest{}
-			raw := json.RawMessage(`{"mcpServers":{"fetch":{"command":"uvx"}}}`)
+	workDir := t.TempDir()
+	manifest := &sidecarManifest{}
+	raw := json.RawMessage(`{"mcpServers":{"fetch":{"command":"uvx"}}}`)
 
-			if err := prepareOmpMcpConfig(workDir, provider, raw, manifest); err != nil {
-				t.Fatalf("prepareOmpMcpConfig: %v", err)
-			}
-			path := filepath.Join(workDir, "."+provider, "mcp.json")
-			data, err := os.ReadFile(path)
-			if err != nil {
-				t.Fatalf("read %s: %v", path, err)
-			}
-			if string(data) != string(raw) {
-				t.Fatalf("config = %s, want %s", data, raw)
-			}
-			if !containsPath(manifest.Files, path) || !containsPath(manifest.Dirs, filepath.Dir(path)) {
-				t.Fatalf("manifest = %#v, want config file and directory", manifest)
-			}
-		})
+	if err := prepareOmpMcpConfig(workDir, "omp", raw, manifest); err != nil {
+		t.Fatalf("prepareOmpMcpConfig: %v", err)
+	}
+	path := filepath.Join(workDir, ".omp", "mcp.json")
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read %s: %v", path, err)
+	}
+	if string(data) != string(raw) {
+		t.Fatalf("config = %s, want %s", data, raw)
+	}
+	if !containsPath(manifest.Files, path) || !containsPath(manifest.Dirs, filepath.Dir(path)) {
+		t.Fatalf("manifest = %#v, want config file and directory", manifest)
 	}
 }
 

@@ -604,7 +604,7 @@ func Prepare(params PrepareParams, logger *slog.Logger) (*Environment, error) {
 		return nil, fmt.Errorf("execenv: write context files: %w", err)
 	}
 	if err := prepareOmpMcpConfig(workDir, params.Provider, params.McpConfig, manifest); err != nil {
-		return nil, fmt.Errorf("execenv: prepare %s mcp config: %w", params.Provider, err)
+		return nil, fmt.Errorf("execenv: prepare omp mcp config: %w", err)
 	}
 
 	// Persist managed-env provenance for non-local resumable envs at Prepare time
@@ -899,7 +899,7 @@ func Reuse(params ReuseParams, logger *slog.Logger) *Environment {
 		logger.Warn("execenv: refresh context files failed", "error", err)
 	}
 	if err := prepareOmpMcpConfig(params.WorkDir, params.Provider, params.McpConfig, manifest); err != nil {
-		logger.Warn("execenv: refresh "+params.Provider+" mcp config failed; forcing fresh prepare", "error", err)
+		logger.Warn("execenv: refresh omp mcp config failed; forcing fresh prepare", "error", err)
 		return nil
 	}
 
