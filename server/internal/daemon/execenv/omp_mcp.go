@@ -7,7 +7,7 @@ import (
 	"path/filepath"
 )
 
-func preparePiMcpConfig(workDir, provider string, raw json.RawMessage, manifest *sidecarManifest) error {
+func prepareOmpMcpConfig(workDir, provider string, raw json.RawMessage, manifest *sidecarManifest) error {
 	if provider != "omp" {
 		return nil
 	}

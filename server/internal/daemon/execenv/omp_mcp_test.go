@@ -9,15 +9,15 @@ import (
 	"testing"
 )
 
-func TestPreparePiMcpConfigUsesProviderNamespace(t *testing.T) {
+func TestPrepareOmpMcpConfigUsesProviderNamespace(t *testing.T) {
 	for _, provider := range []string{"omp"} {
 		t.Run(provider, func(t *testing.T) {
 			workDir := t.TempDir()
 			manifest := &sidecarManifest{}
 			raw := json.RawMessage(`{"mcpServers":{"fetch":{"command":"uvx"}}}`)
 
-			if err := preparePiMcpConfig(workDir, provider, raw, manifest); err != nil {
-				t.Fatalf("preparePiMcpConfig: %v", err)
+			if err := prepareOmpMcpConfig(workDir, provider, raw, manifest); err != nil {
+				t.Fatalf("prepareOmpMcpConfig: %v", err)
 			}
 			path := filepath.Join(workDir, "."+provider, "mcp.json")
 			data, err := os.ReadFile(path)
@@ -34,7 +34,7 @@ func TestPreparePiMcpConfigUsesProviderNamespace(t *testing.T) {
 	}
 }
 
-func TestPreparePiMcpConfigRefusesExistingManagedPath(t *testing.T) {
+func TestPrepareOmpMcpConfigRefusesExistingManagedPath(t *testing.T) {
 	workDir := t.TempDir()
 	path := filepath.Join(workDir, ".omp", "mcp.json")
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
@@ -45,7 +45,7 @@ func TestPreparePiMcpConfigRefusesExistingManagedPath(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	err := preparePiMcpConfig(workDir, "omp", json.RawMessage(`{"mcpServers":{"managed":{}}}`), &sidecarManifest{})
+	err := prepareOmpMcpConfig(workDir, "omp", json.RawMessage(`{"mcpServers":{"managed":{}}}`), &sidecarManifest{})
 	if err == nil || !strings.Contains(err.Error(), "would overwrite") {
 		t.Fatalf("error = %v, want overwrite error", err)
 	}
@@ -58,11 +58,11 @@ func TestPreparePiMcpConfigRefusesExistingManagedPath(t *testing.T) {
 	}
 }
 
-func TestPreparePiMcpConfigCleanupRemovesManagedFiles(t *testing.T) {
+func TestPrepareOmpMcpConfigCleanupRemovesManagedFiles(t *testing.T) {
 	workDir := t.TempDir()
 	envRoot := t.TempDir()
 	manifest := &sidecarManifest{}
-	if err := preparePiMcpConfig(workDir, "omp", json.RawMessage(`{"mcpServers":{"fetch":{}}}`), manifest); err != nil {
+	if err := prepareOmpMcpConfig(workDir, "omp", json.RawMessage(`{"mcpServers":{"fetch":{}}}`), manifest); err != nil {
 		t.Fatal(err)
 	}
 	if err := writeSidecarManifest(envRoot, manifest); err != nil {

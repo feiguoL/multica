@@ -603,7 +603,7 @@ func Prepare(params PrepareParams, logger *slog.Logger) (*Environment, error) {
 	if err := writeContextFiles(workDir, params.Provider, params.Task, manifest); err != nil {
 		return nil, fmt.Errorf("execenv: write context files: %w", err)
 	}
-	if err := preparePiMcpConfig(workDir, params.Provider, params.McpConfig, manifest); err != nil {
+	if err := prepareOmpMcpConfig(workDir, params.Provider, params.McpConfig, manifest); err != nil {
 		return nil, fmt.Errorf("execenv: prepare %s mcp config: %w", params.Provider, err)
 	}
 
@@ -898,8 +898,8 @@ func Reuse(params ReuseParams, logger *slog.Logger) *Environment {
 	if err := writeContextFiles(params.WorkDir, params.Provider, params.Task, manifest); err != nil {
 		logger.Warn("execenv: refresh context files failed", "error", err)
 	}
-	if err := preparePiMcpConfig(params.WorkDir, params.Provider, params.McpConfig, manifest); err != nil {
-		logger.Warn("execenv: refresh omp mcp config failed; forcing fresh prepare", "error", err)
+	if err := prepareOmpMcpConfig(params.WorkDir, params.Provider, params.McpConfig, manifest); err != nil {
+		logger.Warn("execenv: refresh "+params.Provider+" mcp config failed; forcing fresh prepare", "error", err)
 		return nil
 	}
 
