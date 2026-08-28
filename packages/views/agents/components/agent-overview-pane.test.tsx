@@ -189,7 +189,6 @@ describe("AgentOverviewPane MCP tab visibility", () => {
     ["Kiro", "kiro"],
     ["OpenCode", "opencode"],
     ["OpenClaw", "openclaw"],
-    ["Pi", "pi"],
     ["Oh My Pi", "omp"],
   ])("renders the MCP tab when the agent runs on the %s runtime", (_label, provider) => {
     renderPane([makeRuntime(provider)]);

@@ -8,7 +8,7 @@ import (
 )
 
 func preparePiMcpConfig(workDir, provider string, raw json.RawMessage, manifest *sidecarManifest) error {
-	if provider != "pi" && provider != "omp" {
+	if provider != "omp" {
 		return nil
 	}
 	trimmed := bytes.TrimSpace(raw)

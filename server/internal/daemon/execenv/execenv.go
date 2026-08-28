@@ -61,7 +61,7 @@ type PrepareParams struct {
 	OpenclawBin  string // resolved openclaw CLI path (only used when Provider == "openclaw"); empty = look up on PATH
 	// McpConfig is the agent's saved `mcp_config` JSON, forwarded to the
 	// provider-specific config preparer when that provider materialises MCP
-	// via a per-task config file. Cursor, OpenClaw, Pi, and OMP consume it here;
+	// via a per-task config file. Cursor, OpenClaw, and OMP consume it here;
 	// other providers wire MCP via ExecOptions.McpConfig in the agent backend.
 	McpConfig json.RawMessage
 	// CursorMcpAuthSource is an explicit opt-in path to a Cursor mcp-auth.json
@@ -899,7 +899,8 @@ func Reuse(params ReuseParams, logger *slog.Logger) *Environment {
 		logger.Warn("execenv: refresh context files failed", "error", err)
 	}
 	if err := preparePiMcpConfig(params.WorkDir, params.Provider, params.McpConfig, manifest); err != nil {
-		logger.Warn("execenv: refresh pi mcp config failed", "error", err)
+		logger.Warn("execenv: refresh omp mcp config failed; forcing fresh prepare", "error", err)
+		return nil
 	}
 
 	// Restore CodexHome for Codex provider — the per-task codex-home directory

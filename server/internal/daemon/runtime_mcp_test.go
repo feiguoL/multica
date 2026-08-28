@@ -54,8 +54,8 @@ func TestListRuntimeLocalMcpServersClaudeMissingConfig(t *testing.T) {
 	}
 }
 
-func TestListRuntimeLocalMcpServersPiAndOmpReadNativeConfig(t *testing.T) {
-	for _, provider := range []string{"pi", "omp"} {
+func TestListRuntimeLocalMcpServersOmpReadsNativeConfig(t *testing.T) {
+	for _, provider := range []string{"omp"} {
 		t.Run(provider, func(t *testing.T) {
 			home := t.TempDir()
 			t.Setenv("HOME", home)
@@ -117,8 +117,8 @@ func TestListRuntimeLocalMcpServersUnknownProvider(t *testing.T) {
 	}
 }
 
-func TestMergeRuntimeAndAgentMcpConfigPiProvidersUseAgentConfig(t *testing.T) {
-	for _, provider := range []string{"pi", "omp"} {
+func TestMergeRuntimeAndAgentMcpConfigOmpUsesAgentConfig(t *testing.T) {
+	for _, provider := range []string{"omp"} {
 		t.Run(provider, func(t *testing.T) {
 			t.Setenv("HOME", t.TempDir())
 			merged, err := mergeRuntimeAndAgentMcpConfig(provider, json.RawMessage(`{"mcpServers":{"agent":{"command":"agent-server"}}}`))

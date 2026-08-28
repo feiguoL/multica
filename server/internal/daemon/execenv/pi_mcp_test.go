@@ -10,7 +10,7 @@ import (
 )
 
 func TestPreparePiMcpConfigUsesProviderNamespace(t *testing.T) {
-	for _, provider := range []string{"pi", "omp"} {
+	for _, provider := range []string{"omp"} {
 		t.Run(provider, func(t *testing.T) {
 			workDir := t.TempDir()
 			manifest := &sidecarManifest{}
@@ -36,7 +36,7 @@ func TestPreparePiMcpConfigUsesProviderNamespace(t *testing.T) {
 
 func TestPreparePiMcpConfigRefusesExistingManagedPath(t *testing.T) {
 	workDir := t.TempDir()
-	path := filepath.Join(workDir, ".pi", "mcp.json")
+	path := filepath.Join(workDir, ".omp", "mcp.json")
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		t.Fatal(err)
 	}
@@ -45,7 +45,7 @@ func TestPreparePiMcpConfigRefusesExistingManagedPath(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	err := preparePiMcpConfig(workDir, "pi", json.RawMessage(`{"mcpServers":{"managed":{}}}`), &sidecarManifest{})
+	err := preparePiMcpConfig(workDir, "omp", json.RawMessage(`{"mcpServers":{"managed":{}}}`), &sidecarManifest{})
 	if err == nil || !strings.Contains(err.Error(), "would overwrite") {
 		t.Fatalf("error = %v, want overwrite error", err)
 	}
