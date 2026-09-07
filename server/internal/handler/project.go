@@ -943,7 +943,6 @@ func buildProjectSearchQuery(phrase string, terms []string, includeClosed bool) 
 		p.status, p.priority, p.lead_type, p.lead_id,
 		p.start_date, p.due_date,
 		p.created_at, p.updated_at, p.parent_project_id,
-		COUNT(*) OVER() AS total_count,
 		%s AS match_source
 	FROM project p
 	WHERE p.workspace_id = %s AND %s
@@ -1002,7 +1001,6 @@ func (h *Handler) SearchProjects(w http.ResponseWriter, r *http.Request) {
 
 	type projectSearchRow struct {
 		project     db.Project
-		totalCount  int64
 		matchSource string
 	}
 
@@ -1025,7 +1023,6 @@ func (h *Handler) SearchProjects(w http.ResponseWriter, r *http.Request) {
 				&row.project.CreatedAt,
 				&row.project.UpdatedAt,
 				&row.project.ParentProjectID,
-				&row.totalCount,
 				&row.matchSource,
 			); err != nil {
 				return fmt.Errorf("scan: %w", err)
