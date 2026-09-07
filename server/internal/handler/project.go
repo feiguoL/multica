@@ -1002,6 +1002,7 @@ func (h *Handler) SearchProjects(w http.ResponseWriter, r *http.Request) {
 
 	type projectSearchRow struct {
 		project     db.Project
+		totalCount  int64
 		matchSource string
 	}
 
@@ -1133,7 +1134,12 @@ func (h *Handler) projectsToResponses(ctx context.Context, wsUUID pgtype.UUID, p
 		for i, p := range projects {
 			projectIDs[i] = p.ID
 		}
-		stats, err := h.Queries.GetProjectIssueStats(ctx, projectIDs)
+		terminalStatusKeys := h.projectTerminalIssueStatusKeys(ctx, wsUUID)
+		stats, err := h.Queries.GetProjectIssueStats(ctx, db.GetProjectIssueStatsParams{
+			WorkspaceID:        wsUUID,
+			ProjectIds:         projectIDs,
+			TerminalStatusKeys: terminalStatusKeys,
+		})
 		if err == nil {
 			for _, s := range stats {
 				statsMap[uuidToString(s.ProjectID)] = s
@@ -1203,7 +1209,12 @@ func (h *Handler) GetProjectTree(w http.ResponseWriter, r *http.Request) {
 		for i, p := range allProjects {
 			projectIDs[i] = p.ID
 		}
-		stats, err := h.Queries.GetProjectIssueStats(r.Context(), projectIDs)
+		terminalStatusKeys := h.projectTerminalIssueStatusKeys(r.Context(), wsUUID)
+		stats, err := h.Queries.GetProjectIssueStats(r.Context(), db.GetProjectIssueStatsParams{
+			WorkspaceID:        wsUUID,
+			ProjectIds:         projectIDs,
+			TerminalStatusKeys: terminalStatusKeys,
+		})
 		if err == nil {
 			for _, s := range stats {
 				statsMap[uuidToString(s.ProjectID)] = s
