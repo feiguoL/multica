@@ -1540,6 +1540,7 @@ WHERE id = (
     WHERE atq.agent_id = $2
       AND atq.runtime_id = $3
       AND atq.status = 'queued'
+      AND (atq.context->>'wakeup_id' IS NULL OR EXISTS (SELECT 1 FROM issue_wakeup w WHERE w.id=(atq.context->>'wakeup_id')::uuid AND w.disabled_at IS NULL AND w.revision=(atq.context->>'wakeup_revision')::bigint))
       AND EXISTS (
           SELECT 1
           FROM agent a
@@ -1547,21 +1548,13 @@ WHERE id = (
           WHERE a.id = atq.agent_id
             -- A task's persisted runtime is not authority after an agent rebind.
             AND a.runtime_id = atq.runtime_id
-            -- Private runtimes only execute their owner's agents. Ownerless
-            -- runtime/agent rows remain claimable only so the handler can
-            -- settle them explicitly before daemon delivery; filtering them
-            -- here would leave every task silently queued until the TTL.
-            -- Public runtimes remain shareable across agent owners.
+            -- Queued private-runtime rows are claimable so the handler can
+            -- settle an owner mismatch through the existing FailTask path
+            -- before daemon delivery. Public runtimes remain shareable across
+            -- agent owners; dispatched reclaim keeps its owner fence below.
             AND (
                 r.visibility = 'public'
-                OR (
-                    r.visibility = 'private'
-                    AND (
-                        r.owner_id IS NULL
-                        OR a.owner_id IS NULL
-                        OR r.owner_id = a.owner_id
-                    )
-                )
+                OR r.visibility = 'private'
             )
             AND r.status = 'online'
             AND COALESCE(r.last_seen_at, r.updated_at) >=
@@ -2894,7 +2887,7 @@ INSERT INTO agent_task_queue (
     originator_source, delegated_from_task_id, rule_version_id,
     trigger_evidence_kind, trigger_evidence_ref_id, retry_of_task_id,
     chat_input_task_id, fire_at,
-    channel_context_revision, id
+    channel_context_revision, handoff_note, id
 )
 SELECT
     p.agent_id, p.runtime_id, p.issue_id, p.chat_session_id, p.autopilot_run_id,
@@ -2915,6 +2908,7 @@ SELECT
     p.trigger_evidence_kind, p.trigger_evidence_ref_id, p.id,
     p.chat_input_task_id, $2,
     p.channel_context_revision,
+    CASE WHEN p.context->>'wakeup_id' IS NOT NULL THEN p.handoff_note END,
     -- Named new_task_id, not id: $1 above is the PARENT task's id.
     COALESCE($6::uuid, gen_random_uuid())
 FROM agent_task_queue p
@@ -4419,6 +4413,28 @@ func (q *Queries) GetAgentTaskInWorkspace(ctx context.Context, arg GetAgentTaskI
 	return i, err
 }
 
+const getAgentTaskStatus = `-- name: GetAgentTaskStatus :one
+SELECT atq.status, a.workspace_id
+FROM agent_task_queue atq
+JOIN agent a ON a.id = atq.agent_id
+WHERE atq.id = $1
+`
+
+type GetAgentTaskStatusRow struct {
+	Status      string      `json:"status"`
+	WorkspaceID pgtype.UUID `json:"workspace_id"`
+}
+
+// Hot-path status polling needs only the task status and the owning agent's
+// workspace for authorization. Keep this independent of optional source links
+// (issue, chat session, autopilot run) so it needs no source-entity lookup.
+func (q *Queries) GetAgentTaskStatus(ctx context.Context, id pgtype.UUID) (GetAgentTaskStatusRow, error) {
+	row := q.db.QueryRow(ctx, getAgentTaskStatus, id)
+	var i GetAgentTaskStatusRow
+	err := row.Scan(&i.Status, &i.WorkspaceID)
+	return i, err
+}
+
 const getCommentThreadRootID = `-- name: GetCommentThreadRootID :one
 SELECT comment_thread_root_id($1::uuid)::uuid AS id
 `
@@ -4450,6 +4466,7 @@ WITH retired_sessions AS (
 ), latest_per_session AS (
     SELECT DISTINCT ON (t.session_id)
         t.session_id, t.work_dir, t.runtime_id, t.status, t.failure_reason, t.error,
+        t.started_at, t.issue_snapshot,
         COALESCE(t.completed_at, t.started_at, t.dispatched_at, t.created_at) AS terminal_at
     FROM agent_task_queue t
     WHERE t.agent_id = $1 AND t.issue_id = $2
@@ -4458,7 +4475,7 @@ WITH retired_sessions AS (
       AND t.status IN ('completed', 'failed', 'cancelled')
     ORDER BY t.session_id, COALESCE(t.completed_at, t.started_at, t.dispatched_at, t.created_at) DESC
 )
-SELECT session_id, work_dir, runtime_id FROM latest_per_session
+SELECT session_id, work_dir, runtime_id, status, started_at, issue_snapshot FROM latest_per_session
 WHERE session_id NOT IN (SELECT session_id FROM retired_sessions)
   AND (
     status IN ('completed', 'cancelled')
@@ -4504,9 +4521,12 @@ type GetLastTaskSessionParams struct {
 }
 
 type GetLastTaskSessionRow struct {
-	SessionID pgtype.Text `json:"session_id"`
-	WorkDir   pgtype.Text `json:"work_dir"`
-	RuntimeID pgtype.UUID `json:"runtime_id"`
+	SessionID     pgtype.Text        `json:"session_id"`
+	WorkDir       pgtype.Text        `json:"work_dir"`
+	RuntimeID     pgtype.UUID        `json:"runtime_id"`
+	Status        string             `json:"status"`
+	StartedAt     pgtype.Timestamptz `json:"started_at"`
+	IssueSnapshot []byte             `json:"issue_snapshot"`
 }
 
 // Returns the session_id and work_dir from the most recent task for a given
@@ -4618,36 +4638,29 @@ type GetLastTaskSessionRow struct {
 // healthy. retired_session_id records the abandonment itself, so one row
 // retiring a session removes it from every later lookup no matter how many
 // clean rows still reference it.
+// status, started_at and issue_snapshot ride along because the row this query
+// picks IS the run whose context the next turn continues, and both of a claim's
+// deltas must be measured from THAT run rather than from whichever run started
+// last (MUL-7344). status is what says the run actually delivered its prompt to
+// the provider: this query deliberately accepts failed and cancelled rows so
+// their SESSION stays resumable, but such a row may have died before the agent
+// ever ran, and its snapshot would then describe an issue the session never
+// saw. The two are not always the same row: this query skips poisoned
+// and retired sessions, so it can legitimately return an OLDER run than the
+// newest one. Measuring against the newest one would then tell an agent whose
+// resumed memory predates an edit that the issue is unchanged.
 func (q *Queries) GetLastTaskSession(ctx context.Context, arg GetLastTaskSessionParams) (GetLastTaskSessionRow, error) {
 	row := q.db.QueryRow(ctx, getLastTaskSession, arg.AgentID, arg.IssueID)
 	var i GetLastTaskSessionRow
-	err := row.Scan(&i.SessionID, &i.WorkDir, &i.RuntimeID)
+	err := row.Scan(
+		&i.SessionID,
+		&i.WorkDir,
+		&i.RuntimeID,
+		&i.Status,
+		&i.StartedAt,
+		&i.IssueSnapshot,
+	)
 	return i, err
-}
-
-const getLastTaskStartedAtForIssueAndAgent = `-- name: GetLastTaskStartedAtForIssueAndAgent :one
-SELECT started_at FROM agent_task_queue
-WHERE agent_id = $1 AND issue_id = $2 AND started_at IS NOT NULL
-ORDER BY started_at DESC
-LIMIT 1
-`
-
-type GetLastTaskStartedAtForIssueAndAgentParams struct {
-	AgentID pgtype.UUID `json:"agent_id"`
-	IssueID pgtype.UUID `json:"issue_id"`
-}
-
-// Returns the started_at of the most recent prior task for this (agent, issue)
-// pair, used as the "since" anchor for counting comments that arrived since the
-// agent's last run. Any terminal state counts as "a run happened". Tasks with
-// no started_at (never dispatched / the just-claimed current task) are excluded,
-// so this never returns the current claim's own row. MUST use started_at, never
-// completed_at: a long run would otherwise miss comments posted while it ran.
-func (q *Queries) GetLastTaskStartedAtForIssueAndAgent(ctx context.Context, arg GetLastTaskStartedAtForIssueAndAgentParams) (pgtype.Timestamptz, error) {
-	row := q.db.QueryRow(ctx, getLastTaskStartedAtForIssueAndAgent, arg.AgentID, arg.IssueID)
-	var started_at pgtype.Timestamptz
-	err := row.Scan(&started_at)
-	return started_at, err
 }
 
 const getLatestChatTaskRolloutMissing = `-- name: GetLatestChatTaskRolloutMissing :one
@@ -4748,7 +4761,10 @@ SELECT
     COUNT(*)::int AS task_count,
     COUNT(*) FILTER (WHERE atq.status = 'failed')::int AS failed_count,
     COUNT(*) FILTER (WHERE atq.status = 'completed')::int AS completed_count,
-    COUNT(*) FILTER (WHERE atq.status = 'cancelled')::int AS cancelled_count
+    COUNT(*) FILTER (WHERE atq.status = 'cancelled')::int AS cancelled_count,
+    COALESCE(SUM(EXTRACT(EPOCH FROM (atq.completed_at - atq.started_at)) * 1000)
+        FILTER (WHERE atq.completed_at > atq.started_at), 0)::float8 AS duration_ms,
+    COUNT(*) FILTER (WHERE atq.completed_at > atq.started_at)::int AS duration_count
 FROM agent_task_queue atq
 JOIN agent a ON a.id = atq.agent_id
 WHERE a.workspace_id = $1
@@ -4765,6 +4781,8 @@ type GetWorkspaceAgentActivity30dRow struct {
 	FailedCount    int32              `json:"failed_count"`
 	CompletedCount int32              `json:"completed_count"`
 	CancelledCount int32              `json:"cancelled_count"`
+	DurationMs     float64            `json:"duration_ms"`
+	DurationCount  int32              `json:"duration_count"`
 }
 
 // Returns per-agent daily activity buckets for the last 30 days. Single
@@ -4799,6 +4817,8 @@ func (q *Queries) GetWorkspaceAgentActivity30d(ctx context.Context, workspaceID 
 			&i.FailedCount,
 			&i.CompletedCount,
 			&i.CancelledCount,
+			&i.DurationMs,
+			&i.DurationCount,
 		); err != nil {
 			return nil, err
 		}
@@ -4921,7 +4941,7 @@ func (q *Queries) HasActiveTaskForIssueAndAgentInThread(ctx context.Context, arg
 
 const hasPendingTaskForIssue = `-- name: HasPendingTaskForIssue :one
 SELECT count(*) > 0 AS has_pending FROM agent_task_queue
-WHERE issue_id = $1 AND status IN ('queued', 'dispatched')
+WHERE context->>'wakeup_id' IS NULL AND issue_id = $1 AND status IN ('queued', 'dispatched')
 `
 
 // Returns true if there is a queued or dispatched (but not yet running) task for the issue.
@@ -4937,7 +4957,7 @@ func (q *Queries) HasPendingTaskForIssue(ctx context.Context, issueID pgtype.UUI
 
 const hasPendingTaskForIssueAndAgent = `-- name: HasPendingTaskForIssueAndAgent :one
 SELECT count(*) > 0 AS has_pending FROM agent_task_queue
-WHERE issue_id = $1 AND agent_id = $2
+WHERE context->>'wakeup_id' IS NULL AND issue_id = $1 AND agent_id = $2
   AND (
     status IN ('queued', 'dispatched')
     OR (status = 'deferred' AND context->>'channel_issue_media_pending' = 'true')
@@ -4974,7 +4994,7 @@ func (q *Queries) HasPendingTaskForIssueAndAgent(ctx context.Context, arg HasPen
 
 const hasPendingTaskForIssueAndAgentExcludingTriggerComment = `-- name: HasPendingTaskForIssueAndAgentExcludingTriggerComment :one
 SELECT count(*) > 0 AS has_pending FROM agent_task_queue
-WHERE issue_id = $1
+WHERE context->>'wakeup_id' IS NULL AND issue_id = $1
   AND agent_id = $2
   AND (
     status IN ('queued', 'dispatched')
@@ -5012,7 +5032,7 @@ func (q *Queries) HasPendingTaskForIssueAndAgentExcludingTriggerComment(ctx cont
 
 const hasPendingTaskForIssueAndAgentExcludingTriggerCommentInThread = `-- name: HasPendingTaskForIssueAndAgentExcludingTriggerCommentInThread :one
 SELECT count(*) > 0 AS has_pending FROM agent_task_queue
-WHERE issue_id = $1
+WHERE context->>'wakeup_id' IS NULL AND issue_id = $1
   AND agent_id = $2
   AND (
     status IN ('queued', 'dispatched')
@@ -5050,7 +5070,7 @@ func (q *Queries) HasPendingTaskForIssueAndAgentExcludingTriggerCommentInThread(
 
 const hasPendingTaskForIssueAndAgentInThread = `-- name: HasPendingTaskForIssueAndAgentInThread :one
 SELECT count(*) > 0 AS has_pending FROM agent_task_queue
-WHERE issue_id = $1 AND agent_id = $2
+WHERE context->>'wakeup_id' IS NULL AND issue_id = $1 AND agent_id = $2
   AND (
     status IN ('queued', 'dispatched')
     OR (status = 'deferred' AND context->>'channel_issue_media_pending' = 'true')
@@ -5140,6 +5160,19 @@ func (q *Queries) HasTaskCoveringDelegatedFailureComment(ctx context.Context, ar
 	var covered bool
 	err := row.Scan(&covered)
 	return covered, err
+}
+
+const hasTaskForIssue = `-- name: HasTaskForIssue :one
+SELECT EXISTS (SELECT 1 FROM agent_task_queue WHERE issue_id = $1)
+`
+
+// Returns true if the issue has any task in any status. Webhook recovery
+// treats even a terminal task as proof that ownership moved downstream.
+func (q *Queries) HasTaskForIssue(ctx context.Context, issueID pgtype.UUID) (bool, error) {
+	row := q.db.QueryRow(ctx, hasTaskForIssue, issueID)
+	var exists bool
+	err := row.Scan(&exists)
+	return exists, err
 }
 
 const linkTaskToIssue = `-- name: LinkTaskToIssue :exec
@@ -5492,11 +5525,29 @@ func (q *Queries) ListActiveTasksByIssueFamily(ctx context.Context, arg ListActi
 const listAgentTasks = `-- name: ListAgentTasks :many
 SELECT id, agent_id, issue_id, status, priority, dispatched_at, started_at, completed_at, result, error, created_at, context, runtime_id, session_id, work_dir, trigger_comment_id, chat_session_id, autopilot_run_id, attempt, max_attempts, parent_task_id, failure_reason, trigger_summary, force_fresh_session, is_leader_task, wait_reason, initiator_user_id, handoff_note, prepare_lease_expires_at, squad_id, runtime_mcp_overlay, escalation_for_task_id, fire_at, originator_user_id, runtime_connected_apps, coalesced_comment_ids, delivered_comment_ids, chat_input_task_id, chat_finalize_deferred_at, originator_source, delegated_from_task_id, retry_of_task_id, rerun_of_task_id, rule_version_id, trigger_evidence_kind, trigger_evidence_ref_id, accountable_user_id, session_rollout_missing, retired_session_id, quick_actions_disabled, regenerate_quick_actions_for, branch_name, durable_work_dir, channel_context_revision, comment_thread_id, cancelled_by_type, cancelled_by_id, cancelled_by_name, issue_snapshot FROM agent_task_queue
 WHERE agent_id = $1
-ORDER BY created_at DESC
+  -- Apply visibility before LIMIT so hidden fallbacks cannot end a page early.
+  -- Keep this predicate in sync with handler.visibleTaskHistory.
+  AND NOT (escalation_for_task_id IS NOT NULL AND started_at IS NULL
+           AND status IN ('deferred', 'cancelled'))
+  AND (created_at, id) < ($2::timestamptz, $3::uuid)
+ORDER BY created_at DESC, id DESC
+LIMIT $4
 `
 
-func (q *Queries) ListAgentTasks(ctx context.Context, agentID pgtype.UUID) ([]AgentTaskQueue, error) {
-	rows, err := q.db.Query(ctx, listAgentTasks, agentID)
+type ListAgentTasksParams struct {
+	AgentID         pgtype.UUID        `json:"agent_id"`
+	BeforeCreatedAt pgtype.Timestamptz `json:"before_created_at"`
+	BeforeID        pgtype.UUID        `json:"before_id"`
+	PageLimit       int32              `json:"page_limit"`
+}
+
+func (q *Queries) ListAgentTasks(ctx context.Context, arg ListAgentTasksParams) ([]AgentTaskQueue, error) {
+	rows, err := q.db.Query(ctx, listAgentTasks,
+		arg.AgentID,
+		arg.BeforeCreatedAt,
+		arg.BeforeID,
+		arg.PageLimit,
+	)
 	if err != nil {
 		return nil, err
 	}
@@ -6073,6 +6124,7 @@ const listQueuedClaimCandidatesByRuntime = `-- name: ListQueuedClaimCandidatesBy
 SELECT atq.id, atq.agent_id, atq.issue_id, atq.status, atq.priority, atq.dispatched_at, atq.started_at, atq.completed_at, atq.result, atq.error, atq.created_at, atq.context, atq.runtime_id, atq.session_id, atq.work_dir, atq.trigger_comment_id, atq.chat_session_id, atq.autopilot_run_id, atq.attempt, atq.max_attempts, atq.parent_task_id, atq.failure_reason, atq.trigger_summary, atq.force_fresh_session, atq.is_leader_task, atq.wait_reason, atq.initiator_user_id, atq.handoff_note, atq.prepare_lease_expires_at, atq.squad_id, atq.runtime_mcp_overlay, atq.escalation_for_task_id, atq.fire_at, atq.originator_user_id, atq.runtime_connected_apps, atq.coalesced_comment_ids, atq.delivered_comment_ids, atq.chat_input_task_id, atq.chat_finalize_deferred_at, atq.originator_source, atq.delegated_from_task_id, atq.retry_of_task_id, atq.rerun_of_task_id, atq.rule_version_id, atq.trigger_evidence_kind, atq.trigger_evidence_ref_id, atq.accountable_user_id, atq.session_rollout_missing, atq.retired_session_id, atq.quick_actions_disabled, atq.regenerate_quick_actions_for, atq.branch_name, atq.durable_work_dir, atq.channel_context_revision, atq.comment_thread_id, atq.cancelled_by_type, atq.cancelled_by_id, atq.cancelled_by_name, atq.issue_snapshot FROM agent_task_queue atq
 WHERE atq.runtime_id = $1
   AND atq.status = 'queued'
+      AND (atq.context->>'wakeup_id' IS NULL OR EXISTS (SELECT 1 FROM issue_wakeup w WHERE w.id=(atq.context->>'wakeup_id')::uuid AND w.disabled_at IS NULL AND w.revision=(atq.context->>'wakeup_revision')::bigint))
   AND EXISTS (
       -- Keep this authorization fence in sync with ClaimAgentTask.
       SELECT 1
@@ -6082,14 +6134,7 @@ WHERE atq.runtime_id = $1
         AND a.runtime_id = atq.runtime_id
         AND (
             r.visibility = 'public'
-            OR (
-                r.visibility = 'private'
-                AND (
-                    r.owner_id IS NULL
-                    OR a.owner_id IS NULL
-                    OR r.owner_id = a.owner_id
-                )
-            )
+            OR r.visibility = 'private'
         )
   )
 ORDER BY atq.priority DESC, atq.created_at ASC
@@ -6187,6 +6232,7 @@ const listQueuedClaimCandidatesByRuntimes = `-- name: ListQueuedClaimCandidatesB
 SELECT atq.id, atq.agent_id, atq.issue_id, atq.status, atq.priority, atq.dispatched_at, atq.started_at, atq.completed_at, atq.result, atq.error, atq.created_at, atq.context, atq.runtime_id, atq.session_id, atq.work_dir, atq.trigger_comment_id, atq.chat_session_id, atq.autopilot_run_id, atq.attempt, atq.max_attempts, atq.parent_task_id, atq.failure_reason, atq.trigger_summary, atq.force_fresh_session, atq.is_leader_task, atq.wait_reason, atq.initiator_user_id, atq.handoff_note, atq.prepare_lease_expires_at, atq.squad_id, atq.runtime_mcp_overlay, atq.escalation_for_task_id, atq.fire_at, atq.originator_user_id, atq.runtime_connected_apps, atq.coalesced_comment_ids, atq.delivered_comment_ids, atq.chat_input_task_id, atq.chat_finalize_deferred_at, atq.originator_source, atq.delegated_from_task_id, atq.retry_of_task_id, atq.rerun_of_task_id, atq.rule_version_id, atq.trigger_evidence_kind, atq.trigger_evidence_ref_id, atq.accountable_user_id, atq.session_rollout_missing, atq.retired_session_id, atq.quick_actions_disabled, atq.regenerate_quick_actions_for, atq.branch_name, atq.durable_work_dir, atq.channel_context_revision, atq.comment_thread_id, atq.cancelled_by_type, atq.cancelled_by_id, atq.cancelled_by_name, atq.issue_snapshot FROM agent_task_queue atq
 WHERE atq.runtime_id = ANY($1::uuid[])
   AND atq.status = 'queued'
+      AND (atq.context->>'wakeup_id' IS NULL OR EXISTS (SELECT 1 FROM issue_wakeup w WHERE w.id=(atq.context->>'wakeup_id')::uuid AND w.disabled_at IS NULL AND w.revision=(atq.context->>'wakeup_revision')::bigint))
   AND EXISTS (
       -- Keep this authorization fence in sync with ClaimAgentTask.
       SELECT 1
@@ -6196,14 +6242,7 @@ WHERE atq.runtime_id = ANY($1::uuid[])
         AND a.runtime_id = atq.runtime_id
         AND (
             r.visibility = 'public'
-            OR (
-                r.visibility = 'private'
-                AND (
-                    r.owner_id IS NULL
-                    OR a.owner_id IS NULL
-                    OR r.owner_id = a.owner_id
-                )
-            )
+            OR r.visibility = 'private'
         )
   )
 ORDER BY atq.priority DESC, atq.created_at ASC
@@ -6385,6 +6424,39 @@ func (q *Queries) ListTasksByIssue(ctx context.Context, issueID pgtype.UUID) ([]
 	return items, nil
 }
 
+const listUserAgentIDsByRuntime = `-- name: ListUserAgentIDsByRuntime :many
+SELECT id FROM agent
+WHERE runtime_id = $1 AND kind = 'user'
+ORDER BY id
+`
+
+// Non-locking companion to ListUserAgentsByRuntimeForUpdate, for callers that
+// must reason about retention GC without taking the teardown's locks.
+//
+// Archived rows are included deliberately, and that is the whole point: an
+// archived agent can still own a non-terminal task, and gcRuntime counts those
+// before it will delete a runtime. A read that filtered them would report a
+// runtime as reclaimable when the sweeper is going to skip it.
+func (q *Queries) ListUserAgentIDsByRuntime(ctx context.Context, runtimeID pgtype.UUID) ([]pgtype.UUID, error) {
+	rows, err := q.db.Query(ctx, listUserAgentIDsByRuntime, runtimeID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []pgtype.UUID{}
+	for rows.Next() {
+		var id pgtype.UUID
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		items = append(items, id)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const listUserAgentsByRuntimeForUpdate = `-- name: ListUserAgentsByRuntimeForUpdate :many
 SELECT id, workspace_id, name, avatar_url, runtime_mode, runtime_config, visibility, status, max_concurrent_tasks, owner_id, created_at, updated_at, description, runtime_id, instructions, archived_at, archived_by, custom_env, custom_args, mcp_config, model, thinking_level, composio_toolkit_allowlist, permission_mode, kind, system_key, disabled_runtime_skills, service_tier, conversation_starters, queued_ttl_seconds FROM agent
 WHERE runtime_id = $1 AND kind = 'user'
@@ -6452,7 +6524,8 @@ const listWorkspaceAgentTaskSnapshot = `-- name: ListWorkspaceAgentTaskSnapshot 
 SELECT atq.id, atq.agent_id, atq.issue_id, atq.status, atq.priority, atq.dispatched_at, atq.started_at, atq.completed_at, atq.result, atq.error, atq.created_at, atq.context, atq.runtime_id, atq.session_id, atq.work_dir, atq.trigger_comment_id, atq.chat_session_id, atq.autopilot_run_id, atq.attempt, atq.max_attempts, atq.parent_task_id, atq.failure_reason, atq.trigger_summary, atq.force_fresh_session, atq.is_leader_task, atq.wait_reason, atq.initiator_user_id, atq.handoff_note, atq.prepare_lease_expires_at, atq.squad_id, atq.runtime_mcp_overlay, atq.escalation_for_task_id, atq.fire_at, atq.originator_user_id, atq.runtime_connected_apps, atq.coalesced_comment_ids, atq.delivered_comment_ids, atq.chat_input_task_id, atq.chat_finalize_deferred_at, atq.originator_source, atq.delegated_from_task_id, atq.retry_of_task_id, atq.rerun_of_task_id, atq.rule_version_id, atq.trigger_evidence_kind, atq.trigger_evidence_ref_id, atq.accountable_user_id, atq.session_rollout_missing, atq.retired_session_id, atq.quick_actions_disabled, atq.regenerate_quick_actions_for, atq.branch_name, atq.durable_work_dir, atq.channel_context_revision, atq.comment_thread_id, atq.cancelled_by_type, atq.cancelled_by_id, atq.cancelled_by_name, atq.issue_snapshot FROM agent_task_queue atq
 JOIN agent a ON a.id = atq.agent_id
 WHERE a.workspace_id = $1
-  AND atq.status IN ('queued', 'dispatched', 'running', 'waiting_local_directory')
+  AND (atq.status IN ('queued', 'dispatched', 'running', 'waiting_local_directory')
+    OR (atq.status='deferred' AND atq.context->>'wakeup_id' IS NOT NULL))
 
 UNION ALL
 
@@ -6490,7 +6563,7 @@ WHERE a.workspace_id = $1
 // grows with how much terminal history the workspace has accumulated. The
 // (created_at, id) tie-break makes the pick deterministic when completed_at
 // ties or is NULL — plain completed_at DESC returned an arbitrary row there.
-// Row shape and row set are unchanged.
+// Deferred wakeup retries also remain visible as queued work.
 //
 // Both halves JOIN / scan agent because agent_task_queue has no workspace_id.
 func (q *Queries) ListWorkspaceAgentTaskSnapshot(ctx context.Context, workspaceID pgtype.UUID) ([]AgentTaskQueue, error) {
@@ -6807,6 +6880,88 @@ func (q *Queries) LockAgentForAutopilotAssignment(ctx context.Context, arg LockA
 	return i, err
 }
 
+const lockAgentTaskStartClaim = `-- name: LockAgentTaskStartClaim :one
+SELECT id, agent_id, issue_id, status, priority, dispatched_at, started_at, completed_at, result, error, created_at, context, runtime_id, session_id, work_dir, trigger_comment_id, chat_session_id, autopilot_run_id, attempt, max_attempts, parent_task_id, failure_reason, trigger_summary, force_fresh_session, is_leader_task, wait_reason, initiator_user_id, handoff_note, prepare_lease_expires_at, squad_id, runtime_mcp_overlay, escalation_for_task_id, fire_at, originator_user_id, runtime_connected_apps, coalesced_comment_ids, delivered_comment_ids, chat_input_task_id, chat_finalize_deferred_at, originator_source, delegated_from_task_id, retry_of_task_id, rerun_of_task_id, rule_version_id, trigger_evidence_kind, trigger_evidence_ref_id, accountable_user_id, session_rollout_missing, retired_session_id, quick_actions_disabled, regenerate_quick_actions_for, branch_name, durable_work_dir, channel_context_revision, comment_thread_id, cancelled_by_type, cancelled_by_id, cancelled_by_name, issue_snapshot FROM agent_task_queue
+WHERE id = $1 AND runtime_id = $2 AND dispatched_at = $3
+  AND status IN ('dispatched', 'waiting_local_directory', 'running')
+FOR UPDATE
+`
+
+type LockAgentTaskStartClaimParams struct {
+	ID           pgtype.UUID        `json:"id"`
+	RuntimeID    pgtype.UUID        `json:"runtime_id"`
+	DispatchedAt pgtype.Timestamptz `json:"dispatched_at"`
+}
+
+// Serialize start/replay with reclaim and cancellation. A stale delivery must
+// never start or acknowledge a newer claim, even on the same runtime.
+func (q *Queries) LockAgentTaskStartClaim(ctx context.Context, arg LockAgentTaskStartClaimParams) (AgentTaskQueue, error) {
+	row := q.db.QueryRow(ctx, lockAgentTaskStartClaim, arg.ID, arg.RuntimeID, arg.DispatchedAt)
+	var i AgentTaskQueue
+	err := row.Scan(
+		&i.ID,
+		&i.AgentID,
+		&i.IssueID,
+		&i.Status,
+		&i.Priority,
+		&i.DispatchedAt,
+		&i.StartedAt,
+		&i.CompletedAt,
+		&i.Result,
+		&i.Error,
+		&i.CreatedAt,
+		&i.Context,
+		&i.RuntimeID,
+		&i.SessionID,
+		&i.WorkDir,
+		&i.TriggerCommentID,
+		&i.ChatSessionID,
+		&i.AutopilotRunID,
+		&i.Attempt,
+		&i.MaxAttempts,
+		&i.ParentTaskID,
+		&i.FailureReason,
+		&i.TriggerSummary,
+		&i.ForceFreshSession,
+		&i.IsLeaderTask,
+		&i.WaitReason,
+		&i.InitiatorUserID,
+		&i.HandoffNote,
+		&i.PrepareLeaseExpiresAt,
+		&i.SquadID,
+		&i.RuntimeMcpOverlay,
+		&i.EscalationForTaskID,
+		&i.FireAt,
+		&i.OriginatorUserID,
+		&i.RuntimeConnectedApps,
+		&i.CoalescedCommentIds,
+		&i.DeliveredCommentIds,
+		&i.ChatInputTaskID,
+		&i.ChatFinalizeDeferredAt,
+		&i.OriginatorSource,
+		&i.DelegatedFromTaskID,
+		&i.RetryOfTaskID,
+		&i.RerunOfTaskID,
+		&i.RuleVersionID,
+		&i.TriggerEvidenceKind,
+		&i.TriggerEvidenceRefID,
+		&i.AccountableUserID,
+		&i.SessionRolloutMissing,
+		&i.RetiredSessionID,
+		&i.QuickActionsDisabled,
+		&i.RegenerateQuickActionsFor,
+		&i.BranchName,
+		&i.DurableWorkDir,
+		&i.ChannelContextRevision,
+		&i.CommentThreadID,
+		&i.CancelledByType,
+		&i.CancelledByID,
+		&i.CancelledByName,
+		&i.IssueSnapshot,
+	)
+	return i, err
+}
+
 const markAgentTaskWaitingLocalDirectory = `-- name: MarkAgentTaskWaitingLocalDirectory :one
 UPDATE agent_task_queue
 SET status = 'waiting_local_directory',
@@ -7001,7 +7156,7 @@ SET coalesced_comment_ids = (
     runtime_connected_apps = $11
 WHERE id = (
     SELECT t.id FROM agent_task_queue t
-    WHERE t.issue_id = $12
+    WHERE t.context->>'wakeup_id' IS NULL AND t.issue_id = $12
       AND t.agent_id = $13
       AND t.comment_thread_id IS NOT DISTINCT FROM comment_thread_root_id($1::uuid)
       AND (
@@ -7120,7 +7275,7 @@ SET coalesced_comment_ids = (
     trigger_summary = $2
 WHERE id = (
     SELECT t.id FROM agent_task_queue t
-    WHERE t.issue_id = $3
+    WHERE t.context->>'wakeup_id' IS NULL AND t.issue_id = $3
       AND t.agent_id = $4
       AND t.comment_thread_id IS NOT DISTINCT FROM comment_thread_root_id($1::uuid)
       AND (
@@ -7694,7 +7849,8 @@ WHERE id = (
       AND atq.dispatched_at < now() - make_interval(secs => $3::double precision)
       AND (atq.prepare_lease_expires_at IS NULL OR atq.prepare_lease_expires_at < now())
       AND EXISTS (
-          -- Keep this authorization fence in sync with ClaimAgentTask.
+          -- Keep the dispatched-reclaim owner fence intentionally stricter
+          -- than the queued claim carve-out below.
           SELECT 1
           FROM agent a
           JOIN agent_runtime r ON r.id = atq.runtime_id
@@ -7818,7 +7974,8 @@ WHERE id IN (
       AND atq.dispatched_at < now() - make_interval(secs => $3::double precision)
       AND (atq.prepare_lease_expires_at IS NULL OR atq.prepare_lease_expires_at < now())
       AND EXISTS (
-          -- Keep this authorization fence in sync with ClaimAgentTask.
+          -- Keep the dispatched-reclaim owner fence intentionally stricter
+          -- than the queued claim carve-out below.
           SELECT 1
           FROM agent a
           JOIN agent_runtime r ON r.id = atq.runtime_id
@@ -8112,7 +8269,7 @@ SET coalesced_comment_ids = (
     )
 WHERE id = (
     SELECT t.id FROM agent_task_queue t
-    WHERE t.issue_id = $2
+    WHERE t.context->>'wakeup_id' IS NULL AND t.issue_id = $2
       AND t.agent_id = $3
       AND t.comment_thread_id IS NOT DISTINCT FROM comment_thread_root_id($1::uuid)
       AND t.status IN ('dispatched', 'running', 'waiting_local_directory')
@@ -8468,6 +8625,40 @@ func (q *Queries) SetTaskDeliveredCommentIDs(ctx context.Context, arg SetTaskDel
 	return delivered_comment_ids, err
 }
 
+const setTaskIssueSnapshot = `-- name: SetTaskIssueSnapshot :exec
+UPDATE agent_task_queue
+SET issue_snapshot = $1
+WHERE id = $2
+  AND runtime_id = $3
+  AND status = 'dispatched'
+  AND started_at IS NULL
+  AND dispatched_at = $4
+`
+
+type SetTaskIssueSnapshotParams struct {
+	IssueSnapshot []byte             `json:"issue_snapshot"`
+	TaskID        pgtype.UUID        `json:"task_id"`
+	RuntimeID     pgtype.UUID        `json:"runtime_id"`
+	DispatchedAt  pgtype.Timestamptz `json:"dispatched_at"`
+}
+
+// Record the comparable issue state this claim's payload was built from, so the
+// NEXT run this agent takes on the issue can be told whether the issue itself
+// moved. Written for every issue-bound claim, not just comment-backed ones: an
+// assignment run that skips this leaves the following run with no baseline to
+// compare against, which reads as "not compared" and costs an extra issue read.
+// Same CAS as SetTaskDeliveredCommentIDs so a stale handler cannot overwrite a
+// newer reclaim's snapshot, or write one after execution has started.
+func (q *Queries) SetTaskIssueSnapshot(ctx context.Context, arg SetTaskIssueSnapshotParams) error {
+	_, err := q.db.Exec(ctx, setTaskIssueSnapshot,
+		arg.IssueSnapshot,
+		arg.TaskID,
+		arg.RuntimeID,
+		arg.DispatchedAt,
+	)
+	return err
+}
+
 const settleDelegatedFailureRecoveriesForTask = `-- name: SettleDelegatedFailureRecoveriesForTask :execrows
 UPDATE comment recovery
 SET recovery_settled_at = now()
@@ -8538,10 +8729,11 @@ SET status = 'running',
     started_at = now(),
     wait_reason = NULL,
     prepare_lease_expires_at = NULL
-WHERE id = $1 AND status IN ('dispatched', 'waiting_local_directory')
+WHERE agent_task_queue.id = $1 AND agent_task_queue.status IN ('dispatched', 'waiting_local_directory')
 RETURNING id, agent_id, issue_id, status, priority, dispatched_at, started_at, completed_at, result, error, created_at, context, runtime_id, session_id, work_dir, trigger_comment_id, chat_session_id, autopilot_run_id, attempt, max_attempts, parent_task_id, failure_reason, trigger_summary, force_fresh_session, is_leader_task, wait_reason, initiator_user_id, handoff_note, prepare_lease_expires_at, squad_id, runtime_mcp_overlay, escalation_for_task_id, fire_at, originator_user_id, runtime_connected_apps, coalesced_comment_ids, delivered_comment_ids, chat_input_task_id, chat_finalize_deferred_at, originator_source, delegated_from_task_id, retry_of_task_id, rerun_of_task_id, rule_version_id, trigger_evidence_kind, trigger_evidence_ref_id, accountable_user_id, session_rollout_missing, retired_session_id, quick_actions_disabled, regenerate_quick_actions_for, branch_name, durable_work_dir, channel_context_revision, comment_thread_id, cancelled_by_type, cancelled_by_id, cancelled_by_name, issue_snapshot
 `
 
+// Legacy single-winner transition; generation-aware callers lock the claim first.
 // Transitions a task to running. Accepts either 'dispatched' (the normal
 // claim → run flow) or 'waiting_local_directory' (the daemon held the row in
 // a wait state while another task owned the local_directory path lock; once
